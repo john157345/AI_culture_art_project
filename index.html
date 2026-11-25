@@ -52,6 +52,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    ===================================================== */
 const MUSIC_FILE   = 'music.mp3';     // 배경음악 파일 이름
 const MUSIC_VOLUME = 0.6;             // 음량 (0 ~ 1)
+const RUNWAY_SIZE_RATIO = 1.2;        // 주변 관객의 평균 몸 높이 대비 의상 모델의 기본 비율
 // 의상(GLB) 목록. 한 줄이 의상 하나이고, 줄 끝에 쉼표를 붙입니다.
 // 의상 버튼이 필요 없으면 아래 줄을 지우면 됩니다.
 const MODEL_FILES = [
@@ -292,6 +293,12 @@ people.forEach((p,i)=>{
 
 const HIP = 1.15;            // 앉았을 때 골반 높이
 const SHLD = HIP + 1.19;     // 어깨 높이
+const CROWD_HEAD_ABOVE_HIP = 1.69;
+const CROWD_THIGH_ANGLE = -1.5, CROWD_SHIN_ANGLE = .1;
+// 관객 기본 앉은 자세의 발목~머리 수직 높이. 좌석 단차와 흔들림은 제외합니다.
+const crowdBodyHeight = (CROWD_HEAD_ABOVE_HIP + THIGH*Math.cos(CROWD_THIGH_ANGLE)
+  + SHINL*Math.cos(CROWD_SHIN_ANGLE)) * people.reduce((sum,p)=>sum+p.h,0)/N;
+const runwayBodyHeight = crowdBodyHeight * RUNWAY_SIZE_RATIO;
 
 function updateCrowd(t){
   const on = avatar.visible || holder.visible;
@@ -310,7 +317,7 @@ function updateCrowd(t){
     // 머리: 모델 쪽으로 고개를 돌림
     const hy = clamp(wrap(toModel + Math.sin(t*.5*p.sp+p.ph)*.25 - bodyYaw),-1.2,1.2);
     const hx = (p.phone ? .12 : 0) + Math.sin(t*.7+p.ph)*.04;
-    part.position.set(0,HIP+1.69,0); part.rotation.set(hx,hy,0); part.scale.set(1,1,1); part.updateMatrix();
+    part.position.set(0,HIP+CROWD_HEAD_ABOVE_HIP,0); part.rotation.set(hx,hy,0); part.scale.set(1,1,1); part.updateMatrix();
     headMtx.multiplyMatrices(R,part.matrix);
 
     put(torsoM,i,R,0,HIP+.65,0,0,0,0,1,1,.62);
@@ -318,8 +325,8 @@ function updateCrowd(t){
     put(neckM,i,R,0,HIP+1.37,0);
 
     // 다리: 허벅지는 앞으로, 종아리는 아래로
-    const aTL = -1.5 + Math.sin(t*.6*p.sp+p.ph)*.03, aTR = -1.5 + Math.sin(t*.6*p.sp+p.ph+1.7)*.03;
-    const aSL = .1 + Math.sin(t*.5*p.sp+p.ph)*.04,  aSR = .1 + Math.sin(t*.5*p.sp+p.ph+2.1)*.04;
+    const aTL = CROWD_THIGH_ANGLE + Math.sin(t*.6*p.sp+p.ph)*.03, aTR = CROWD_THIGH_ANGLE + Math.sin(t*.6*p.sp+p.ph+1.7)*.03;
+    const aSL = CROWD_SHIN_ANGLE + Math.sin(t*.5*p.sp+p.ph)*.04,  aSR = CROWD_SHIN_ANGLE + Math.sin(t*.5*p.sp+p.ph+2.1)*.04;
     const leg = (x,aT,aS,thM,shM,shoeM)=>{
       const ky = HIP - THIGH*Math.cos(aT), kz = -THIGH*Math.sin(aT);       // 무릎 위치
       const ay = ky - SHINL*Math.cos(aS),  az = kz - SHINL*Math.sin(aS);   // 발목 위치
@@ -381,7 +388,7 @@ const OUTFITS = [];
 
 // ---- 3D 모델(GLB) 의상: Mixamo 리깅을 MediaPipe 관절에 연결 ----
 const holder = new THREE.Group(); holder.visible = false; scene.add(holder);
-let activeModel = null, modelFit = 1.15;
+let activeModel = null, modelFit = 1;
 const loader = new GLTFLoader();
 
 // 모든 의상이 같은 Mixamo 구조이므로 공통 매핑을 사용합니다.
@@ -404,6 +411,22 @@ function findBone(model,key){
   let found = null;
   model.traverse(n=>{ if(!found && normBone(n.name)===key) found = n; });
   return found;
+}
+
+// 카메라 추적용 holder에 붙이기 전에 원본 기본 자세를 측정합니다.
+function measureRestBodyHeight(model){
+  model.updateMatrixWorld(true);
+  const headBone = findBone(model,'head');
+  const leftFoot = findBone(model,'leftfoot'), rightFoot = findBone(model,'rightfoot');
+  if(headBone && leftFoot && rightFoot){
+    const ankleY = (leftFoot.getWorldPosition(new THREE.Vector3()).y
+      + rightFoot.getWorldPosition(new THREE.Vector3()).y)/2;
+    const height = headBone.getWorldPosition(new THREE.Vector3()).y - ankleY;
+    if(Number.isFinite(height) && height>1e-8) return height;
+  }
+  const height = new THREE.Box3().setFromObject(model,true).getSize(new THREE.Vector3()).y;
+  if(Number.isFinite(height) && height>1e-8) return height;
+  throw new Error('INVALID_MODEL_HEIGHT');
 }
 
 // 메모리 보호: 모델 하나가 GPU 메모리를 크게 쓰므로 최근 2개만 올려두고 나머지는 비웁니다.
@@ -493,13 +516,10 @@ function loadModel(o){
       m.rotation.y = -Math.PI/2; // 원본 모델의 정면 방향을 카메라 쪽으로 보정
       m.position.set(0,0,0);
       m.visible = false;
-      holder.add(m);
-      o.obj = m;
       try{
-        // 모델 키가 1 단위와 많이 다르면(미터/센티미터 단위 등) 1 단위로 맞춥니다.
-        m.updateMatrixWorld(true);
-        const h = new THREE.Box3().setFromObject(m).getSize(new THREE.Vector3()).y;
-        if(h>0 && Math.abs(h-1)>.25){ m.scale.multiplyScalar(1/h); m.updateMatrixWorld(true); }
+        o.obj = m;
+        o.restBodyHeight = measureRestBodyHeight(m);
+        holder.add(m);
         prepareRig(o,m);
         res(m);
       }catch(err){
@@ -521,10 +541,11 @@ function loadModel(o){
 }
 
 // 매 프레임 원래 포즈를 기준으로 관절을 회전시켜 누적 오차를 방지합니다.
-function applyModelPose(o, sm, hm){
+function applyModelPose(o, hm){
   if(!o || !o.obj || !o.bones) return;
 
-  const scale = sm.distanceTo(hm)/.36*modelFit;
+  // 신체 추적은 위치와 자세만 바꿉니다. 모든 의상의 기본 몸 높이는 동일합니다.
+  const scale = (runwayBodyHeight/o.restBodyHeight)*modelFit;
   holder.scale.setScalar(scale);
   holder.quaternion.copy(torso.quaternion);
 
@@ -660,7 +681,7 @@ function update(lm){
   avatar.visible = !usingGlb;
 
   if(usingGlb){
-    applyModelPose(activeModel,sm,hm);
+    applyModelPose(activeModel,hm);
     holder.visible = true;
   }else{
     holder.visible = false;
