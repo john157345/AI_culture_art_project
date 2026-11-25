@@ -504,13 +504,17 @@ function setOutfit(i){
   outfitIdx = (i + OUTFITS.length) % OUTFITS.length;
   const o = OUTFITS[outfitIdx];
   holder.children.forEach(c=>c.visible=false); holder.visible = false; activeModel = null;
+  avatar.visible = true; // 의상 로딩 전에는 기본 아바타를 유지합니다.
   if(o.model){
-    avatar.visible = false;
     if(!o.obj) statusEl.textContent = '모델 불러오는 중… (용량이 커서 몇 초 걸려요)';
     loadModel(o).then(m=>{
       if(OUTFITS[outfitIdx]!==o) return;
-      m.visible = true; activeModel = o; statusEl.textContent = '';
-    }).catch(()=>{ statusEl.textContent = '모델 파일을 불러오지 못했어요. 파일 위치와 이름을 확인해 주세요.'; });
+      m.visible = true; activeModel = o; avatar.visible = false; statusEl.textContent = '';
+    }).catch(err=>{
+      console.error('의상 모델 로딩 실패:',o.url,err);
+      activeModel = null; holder.visible = false; avatar.visible = true;
+      statusEl.textContent = '의상 모델을 불러오지 못했습니다. 기본 아바타로 표시합니다.';
+    });
   }
   [...$('outfits').children].forEach((b,j)=>b.setAttribute('aria-pressed',j===outfitIdx));
 }
@@ -523,8 +527,15 @@ function addModel(name,url,select=true){
   OUTFITS.push({name,model:true,url}); addButton(OUTFITS.length-1);
   if(select) setOutfit(OUTFITS.length-1);
 }
-// 같은 폴더에 GLB 파일이 있으면 의상 버튼이 자동으로 생깁니다. 파일이 없으면 무시됩니다.
-MODEL_FILES.forEach(m=>fetch(m.url,{method:'HEAD'}).then(r=>{ if(r.ok) addModel(m.name,m.url); }).catch(()=>{}));
+// 같은 폴더에 GLB 파일이 있으면 의상 버튼이 자동으로 생깁니다.
+// 첫 번째 모델만 자동 선택하고, 나머지는 버튼만 추가해 로딩 경쟁을 방지합니다.
+let firstModelSelected = false;
+MODEL_FILES.forEach(m=>fetch(m.url,{method:'HEAD'}).then(r=>{
+  if(!r.ok) return;
+  const select = !firstModelSelected;
+  firstModelSelected = true;
+  addModel(m.name,m.url,select);
+}).catch(err=>console.warn('모델 파일 확인 실패:',m.url,err)));
 
 /* ---------- 포즈 → 3D 좌표 ---------- */
 const P = Array.from({length:33},()=>new THREE.Vector3());
@@ -570,10 +581,10 @@ function update(lm){
   setLimb(platR,P[28],P[28].clone().add(drop),.24*k);
 
   const selected = OUTFITS[outfitIdx];
-  const usingGlb = !!(selected && selected.model);
+  const usingGlb = !!(selected && selected.model && activeModel===selected && activeModel.obj);
   avatar.visible = !usingGlb;
 
-  if(usingGlb && activeModel && activeModel.obj){
+  if(usingGlb){
     applyModelPose(activeModel,sm,hm);
     holder.visible = true;
   }else{
