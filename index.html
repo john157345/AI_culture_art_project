@@ -376,21 +376,128 @@ add(torso,new THREE.CylinderGeometry(.5,.62,.5,24),base,[0,-.85,0]);
 
 const OUTFITS = [];
 
-// ---- 3D 모델(GLB) 의상: 몸통 위치/크기/방향만 따라가는 방식 ----
+// ---- 3D 모델(GLB) 의상: Mixamo 리깅을 MediaPipe 관절에 연결 ----
 const holder = new THREE.Group(); holder.visible = false; scene.add(holder);
 let activeModel = null, modelFit = 1.15;
 const loader = new GLTFLoader();
+
+// 모든 의상이 같은 Mixamo 구조이므로 공통 매핑을 사용합니다.
+// from/to는 MediaPipe 랜드마크 번호입니다.
+const BONE_MAP = [
+  {name:'mixamorig:LeftArm',       from:11, to:13},
+  {name:'mixamorig:LeftForeArm',   from:13, to:15},
+  {name:'mixamorig:RightArm',      from:12, to:14},
+  {name:'mixamorig:RightForeArm',  from:14, to:16},
+  {name:'mixamorig:LeftUpLeg',     from:23, to:25},
+  {name:'mixamorig:LeftLeg',       from:25, to:27},
+  {name:'mixamorig:RightUpLeg',    from:24, to:26},
+  {name:'mixamorig:RightLeg',      from:26, to:28}
+];
+
+function prepareRig(o, model){
+  model.updateMatrixWorld(true);
+  holder.updateMatrixWorld(true);
+
+  const hips = model.getObjectByName('mixamorig:Hips');
+  if(!hips) throw new Error('Mixamo Hips bone not found');
+
+  // GLB의 원점이 아니라 실제 골반 관절을 추적 기준점으로 사용합니다.
+  const hipsWorld = hips.getWorldPosition(new THREE.Vector3());
+  o.hipsLocal = holder.worldToLocal(hipsWorld.clone());
+
+  const holderQ = holder.getWorldQuaternion(new THREE.Quaternion()).invert();
+  o.bones = BONE_MAP.map(spec=>{
+    const bone = model.getObjectByName(spec.name);
+    if(!bone) return null;
+
+    const childName = {
+      'mixamorig:LeftArm':'mixamorig:LeftForeArm',
+      'mixamorig:LeftForeArm':'mixamorig:LeftHand',
+      'mixamorig:RightArm':'mixamorig:RightForeArm',
+      'mixamorig:RightForeArm':'mixamorig:RightHand',
+      'mixamorig:LeftUpLeg':'mixamorig:LeftLeg',
+      'mixamorig:LeftLeg':'mixamorig:LeftFoot',
+      'mixamorig:RightUpLeg':'mixamorig:RightLeg',
+      'mixamorig:RightLeg':'mixamorig:RightFoot'
+    }[spec.name];
+    const child = model.getObjectByName(childName);
+    if(!child) return null;
+
+    const a = bone.getWorldPosition(new THREE.Vector3());
+    const b = child.getWorldPosition(new THREE.Vector3());
+    const restDir = b.sub(a).normalize().applyQuaternion(holderQ).normalize();
+    const restWorldQ = bone.getWorldQuaternion(new THREE.Quaternion());
+    const restLocalQ = holderQ.clone().multiply(restWorldQ).normalize();
+
+    return {...spec, bone, restDir, restLocalQ};
+  }).filter(Boolean);
+
+  o.floorOffset = 0;
+  model.updateMatrixWorld(true);
+}
+
 function loadModel(o){
   if(o.promise) return o.promise;
   o.promise = new Promise((res,rej)=>{
     loader.load(o.url, g=>{
       const m = g.scene;
-      m.rotation.y = -Math.PI/2;      // 이 모델은 +X 방향을 보고 있어서 카메라 쪽(+Z)으로 돌림
-      m.position.set(0,-.33,0);       // 모델의 어깨 중심을 기준점에 맞춤
-      m.visible = false; holder.add(m); o.obj = m; res(m);
-    }, e=>{ if(e.total) statusEl.textContent = `모델 불러오는 중… ${Math.round(e.loaded/e.total*100)}%`; }, rej);
+      m.rotation.y = -Math.PI/2; // 원본 모델의 정면 방향을 카메라 쪽으로 보정
+      m.position.set(0,0,0);    // 임의의 -0.33 오프셋 제거
+      m.visible = false;
+      holder.add(m);
+      o.obj = m;
+      try{
+        prepareRig(o,m);
+        res(m);
+      }catch(err){
+        console.error('리깅 초기화 실패:',o.url,err);
+        rej(err);
+      }
+    }, e=>{
+      if(e.total) statusEl.textContent = `모델 불러오는 중… ${Math.round(e.loaded/e.total*100)}%`;
+    }, rej);
   });
   return o.promise;
+}
+
+// 매 프레임 원래 포즈를 기준으로 관절을 회전시켜 누적 오차를 방지합니다.
+function applyModelPose(o, sm, hm){
+  if(!o || !o.obj || !o.bones) return;
+
+  const scale = sm.distanceTo(hm)/.36*modelFit;
+  holder.scale.setScalar(scale);
+  holder.quaternion.copy(torso.quaternion);
+
+  const holderQ = holder.quaternion;
+  const hipsOffset = o.hipsLocal.clone().multiplyScalar(scale).applyQuaternion(holderQ);
+  holder.position.copy(hm).sub(hipsOffset);
+  holder.updateMatrixWorld(true);
+
+  const invHolderQ = holderQ.clone().invert();
+  for(const item of o.bones){
+    const targetDir = P[item.to].clone().sub(P[item.from]);
+    if(targetDir.lengthSq()<1e-8) continue;
+    targetDir.normalize().applyQuaternion(invHolderQ).normalize();
+
+    const delta = new THREE.Quaternion().setFromUnitVectors(item.restDir,targetDir);
+    const desiredWorldQ = holderQ.clone().multiply(delta).multiply(item.restLocalQ).normalize();
+
+    item.bone.parent.updateWorldMatrix(true,false);
+    const parentWorldQ = item.bone.parent.getWorldQuaternion(new THREE.Quaternion());
+    item.bone.quaternion.copy(parentWorldQ.invert().multiply(desiredWorldQ)).normalize();
+    item.bone.updateMatrix();
+    item.bone.updateWorldMatrix(true,false);
+  }
+
+  // 발이 런웨이 바닥에 파묻히거나 뜨는 현상을 줄입니다.
+  o.obj.updateMatrixWorld(true);
+  const bounds = new THREE.Box3().setFromObject(o.obj);
+  if(Number.isFinite(bounds.min.y)){
+    const correction = (FY+.025)-bounds.min.y;
+    o.floorOffset += (correction-o.floorOffset)*.18;
+    holder.position.y += o.floorOffset;
+    holder.updateMatrixWorld(true);
+  }
 }
 function setOutfit(i){
   if(!OUTFITS.length) return;
@@ -434,7 +541,8 @@ function update(lm){
   first = false;
 
   const sw = P[12].distanceTo(P[11]);
-  if (sw < .15) return;
+  if(sw < .15) return;
+
   const sm = V(11,12), hm = V(23,24);
   const x = P[12].clone().sub(P[11]).normalize();
   const y = sm.clone().sub(hm).normalize();
@@ -443,12 +551,8 @@ function update(lm){
   torso.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(x,y,z));
   torso.position.copy(sm).add(hm).multiplyScalar(.5);
   torso.scale.setScalar(sw);
-  if(activeModel){
-    holder.position.copy(sm); holder.quaternion.copy(torso.quaternion);
-    holder.scale.setScalar(sm.distanceTo(hm)/.36*modelFit); holder.visible = true;
-    return;
-  }
 
+  // 기본 아바타도 계속 업데이트하되, GLB 의상을 선택한 동안에는 숨깁니다.
   const k = sw;
   const headPos = V(7,8).add(new THREE.Vector3(0,.04*k,0));
   head.position.copy(headPos); head.scale.setScalar(.27*k);
@@ -464,7 +568,17 @@ function update(lm){
   const drop = new THREE.Vector3(0,-.16*k,0);
   setLimb(platL,P[27],P[27].clone().add(drop),.24*k);
   setLimb(platR,P[28],P[28].clone().add(drop),.24*k);
-  avatar.visible = !(OUTFITS[outfitIdx] && OUTFITS[outfitIdx].model);
+
+  const selected = OUTFITS[outfitIdx];
+  const usingGlb = !!(selected && selected.model);
+  avatar.visible = !usingGlb;
+
+  if(usingGlb && activeModel && activeModel.obj){
+    applyModelPose(activeModel,sm,hm);
+    holder.visible = true;
+  }else{
+    holder.visible = false;
+  }
 }
 
 /* ---------- 카메라 + MediaPipe ---------- */
