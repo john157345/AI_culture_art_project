@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>실시간 모션 런웨이</title>
+<style>
+  :root{--bg1:#4a4c50;--bg2:#121316;--ink:#f1efe9;--accent:#ff6a1a}
+  html,body{margin:0;height:100%;overflow:hidden;background:radial-gradient(ellipse at 50% 35%,var(--bg1),var(--bg2) 75%);color:var(--ink);font-family:"Pretendard","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif}
+  #c{position:fixed;inset:0;width:100%;height:100%}
+  #cam{position:fixed;right:16px;bottom:16px;width:240px;border-radius:8px;transform:scaleX(-1);opacity:.9;border:1px solid #6a6c70;background:#000}
+  #panel{position:fixed;left:20px;top:20px;max-width:340px}
+  #panel h1{font-size:22px;margin:0 0 6px;font-weight:700;letter-spacing:-.02em}
+  #status{font-size:14px;opacity:.8;line-height:1.5;margin:0 0 12px}
+  button{font:inherit;font-size:15px;padding:10px 18px;border:0;border-radius:6px;background:var(--accent);color:#1a0d02;font-weight:700;cursor:pointer}
+  button:focus-visible{outline:3px solid #fff;outline-offset:2px}
+  #outfits{position:fixed;right:20px;top:20px;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;max-width:60vw}
+  #outfits button{background:#2b2d33;color:var(--ink);font-weight:500;padding:8px 14px}
+  #outfits button[aria-pressed="true"]{background:var(--accent);color:#1a0d02;font-weight:700}
+  #hint{position:fixed;left:20px;bottom:16px;font-size:13px;opacity:.55;max-width:60vw;line-height:1.5}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="cam" autoplay muted playsinline></video>
+<div id="panel">
+  <h1>BEYOND FORM</h1>
+  <h2>Live motion Runway</h2>
+  <p id="status">Stand 2~3 meters away so your full body is visible on the webcam. / 웹캠에 전신이 보이도록 2~3m 떨어져 서세요.</p>
+  <button id="start">카메라 시작</button>
+</div>
+<div id="outfits" role="group" aria-label="의상 선택"></div>
+<div id="hint">드래그 회전 · 스크롤 확대/축소 · 1 정면 · 2 런웨이 시점 · 3 측면 · R 정면 복귀 · ← → 의상 전환 · −/+ 모델 크기 · M 음악 켜기/끄기 · H 카메라 미리보기 · F 전체화면</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Reflector } from 'three/addons/objects/Reflector.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+/* =====================================================
+   ★ 여기만 고치면 됩니다 (파일은 이 HTML과 같은 폴더에) ★
+   파일 이름은 영어 소문자, 공백 없이 쓰는 것이 안전합니다.
+   ===================================================== */
+const MUSIC_FILE   = 'music.mp3';     // 배경음악 파일 이름
+const MUSIC_VOLUME = 0.6;             // 음량 (0 ~ 1)
+// 의상(GLB) 목록. 한 줄이 의상 하나이고, 줄 끝에 쉼표를 붙입니다.
+// 의상 버튼이 필요 없으면 아래 줄을 지우면 됩니다.
+const MODEL_FILES = [
+  {name:'Chromatic Chaos', url:'avant.glb'},
+  {name:'Dark Fracture', url:'darksoul.glb'},
+  {name:'Liquid Aurora', url:'bluedress.glb'},
+  {name:'Neo Dynasty', url:'got.glb'},
+  {name:'Shadow Protocol', url:'techware.glb'},
+  {name:'Digital Mist', url:'blue.glb'},
+  {name:'Silk Reverie', url:'korean.glb'},
+  {name:'Violet Pulse', url:'purple.glb'},
+];
+
+
+const $ = id => document.getElementById(id);
+const video = $('cam'), statusEl = $('status');
+
+/* ---------- 배경음악 ---------- */
+const bgm = new Audio(MUSIC_FILE);
+bgm.loop = true; bgm.volume = MUSIC_VOLUME; bgm.preload = 'auto';
+let bgmStarted = false;
+function playBgm(){
+  if(bgmStarted) return;
+  bgm.play().then(()=>{ bgmStarted = true; }).catch(()=>{});   // 브라우저가 막으면 조용히 넘어감
+}
+playBgm();                                         // 허용되면 열리자마자 재생
+addEventListener('pointerdown',playBgm);           // 화면 클릭
+addEventListener('keydown',playBgm);               // 아무 키
+$('start').addEventListener('click',playBgm);      // 카메라 시작 버튼
+addEventListener('keydown',e=>{ if(e.key==='m'||e.key==='M') bgm.muted = !bgm.muted; });
+
+/* 도우미: 함수 선언이라 파일 어디에서 불러도 안전합니다 */
+function add(parent,geo,mat,pos,rot=[0,0,0],sc=[1,1,1]){
+  const m = new THREE.Mesh(geo,mat);
+  m.position.set(...pos); m.rotation.set(...rot); m.scale.set(...sc);
+  parent.add(m); return m;
+}
+const wrap  = a => Math.atan2(Math.sin(a),Math.cos(a));
+const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
+
+/* ---------- 장면 ---------- */
+const renderer = new THREE.WebGLRenderer({canvas:$('c'),antialias:true,alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const scene = new THREE.Scene();
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(),0.04).texture;
+const camera = new THREE.PerspectiveCamera(45,1,0.1,150);
+camera.position.set(0,0,8);
+const controls = new OrbitControls(camera,renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.minDistance = 3;
+controls.maxDistance = 45;
+controls.target.set(0,0,0);
+controls.update();
+
+const VIEWS = {
+  '1': {pos:[0,0,8],      target:[0,0,0]},
+  '2': {pos:[0,-1.4,8.2], target:[0,.2,0]},
+  '3': {pos:[5.5,0,2.5],  target:[0,0,0]},
+};
+let tween = null;
+function goTo(v){
+  tween = { t:0,
+    p0:camera.position.clone(), t0:controls.target.clone(),
+    p1:new THREE.Vector3(...v.pos), t1:new THREE.Vector3(...v.target) };
+}
+controls.addEventListener('start',()=>{ tween = null; });
+const sun = new THREE.DirectionalLight(0xffffff,1.6); sun.position.set(2,4,5); scene.add(sun);
+function resize(){
+  renderer.setSize(innerWidth,innerHeight,false);
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+}
+addEventListener('resize',resize); resize();
+
+/* ---------- 재질 ---------- */
+const M = (c,o={}) => new THREE.MeshStandardMaterial({color:c,roughness:.5,metalness:0,...o});
+
+/* ---------- 런웨이 무대 ---------- */
+const FY = -2.7;                                   // 바닥 높이
+scene.background = new THREE.Color(0x0b0c0f);
+scene.fog = new THREE.Fog(0x0b0c0f,16,90);
+const mirror = new Reflector(new THREE.PlaneGeometry(160,160),{clipBias:.003,textureWidth:512,textureHeight:512,color:0x9aa0a8});
+mirror.rotation.x = -Math.PI/2; mirror.position.y = FY; scene.add(mirror);
+const flat = (w,d,c,o,y,x=0,z=0)=>{
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w,d),new THREE.MeshBasicMaterial({color:c,transparent:true,opacity:o}));
+  m.rotation.x = -Math.PI/2; m.position.set(x,y,z); scene.add(m); return m;
+};
+flat(160,160,0x06070a,.62,FY+.02);
+flat(6,70,0xb9c4d2,.16,FY+.04,0,-15);              // 런웨이 레인
+for(const x of [-3,3]) flat(.1,70,0xeaf3ff,.9,FY+.06,x,-15);   // 런웨이 가장자리 조명선
+const concrete = M(0x2a2c31,{roughness:.9});
+const wall = new THREE.Mesh(new THREE.PlaneGeometry(90,30),concrete); wall.position.set(0,FY+15,-48); scene.add(wall);
+for(let i=0;i<8;i++) for(const sx of [-1,1]){        // 양옆 콘크리트 기둥 (객석 바깥)
+  const c = new THREE.Mesh(new THREE.BoxGeometry(2.2,30,2.2),concrete); c.position.set(sx*15,FY+15,-4-i*6); scene.add(c);
+}
+add(scene,new THREE.BoxGeometry(18,.25,.25),new THREE.MeshBasicMaterial({color:0xffffff}),[0,FY+9,-47.5]); // 끝 무대 조명바
+
+/* ---------- 조명: 천장 스포트라이트 두 개가 사람을 따라다님 ---------- */
+const spots = [];
+const upVec = new THREE.Vector3(0,1,0);
+for(const x of [-5,5]){
+  const sp = new THREE.SpotLight(0xdfe8ff,120,45,.5,.7,1.4); sp.position.set(x,11,-2);
+  sp.target.position.set(0,FY,-1); scene.add(sp,sp.target);
+  const d0 = sp.position.distanceTo(sp.target.position);
+  const beam = new THREE.Mesh(new THREE.ConeGeometry(d0*.28,d0,32,1,true),
+    new THREE.MeshBasicMaterial({color:0xcfdcff,transparent:true,opacity:.07,blending:THREE.AdditiveBlending,depthWrite:false,side:THREE.DoubleSide}));
+  scene.add(beam);
+  spots.push({sp,beam,d0});
+}
+
+// 바닥에 생기는 둥근 빛 웅덩이 (모델 발밑을 따라다님)
+const glowCanvas = document.createElement('canvas'); glowCanvas.width = glowCanvas.height = 128;
+const gctx = glowCanvas.getContext('2d');
+const grad = gctx.createRadialGradient(64,64,0,64,64,64);
+grad.addColorStop(0,'rgba(255,255,255,1)');
+grad.addColorStop(.5,'rgba(255,255,255,.35)');
+grad.addColorStop(1,'rgba(255,255,255,0)');
+gctx.fillStyle = grad; gctx.fillRect(0,0,128,128);
+const pool = new THREE.Mesh(new THREE.PlaneGeometry(1,1),
+  new THREE.MeshBasicMaterial({map:new THREE.CanvasTexture(glowCanvas),color:0xcfdcff,transparent:true,opacity:.55,blending:THREE.AdditiveBlending,depthWrite:false}));
+pool.rotation.x = -Math.PI/2; pool.scale.set(5,5,1); pool.position.set(0,FY+.08,-1); scene.add(pool);
+
+const lightTarget = new THREE.Vector3(0,FY,-1);
+const LIGHT_SMOOTH = .08;      // 클수록 빨리 따라가고, 작을수록 천천히 부드럽게 따라갑니다
+function updateLights(){
+  const on = avatar.visible || holder.visible;
+  const gx = on ? clamp(torso.position.x,-4,4) : 0;     // 좌우 범위 제한
+  const gz = on ? clamp(torso.position.z,-6,3) : -1;    // 앞뒤 범위 제한 (카메라 깊이값은 흔들림이 큼)
+  lightTarget.x += (gx-lightTarget.x)*LIGHT_SMOOTH;
+  lightTarget.z += (gz-lightTarget.z)*LIGHT_SMOOTH;
+  spots.forEach(({sp,beam,d0})=>{
+    sp.target.position.copy(lightTarget);
+    const dir = sp.position.clone().sub(lightTarget), len = dir.length();
+    beam.position.copy(sp.position).add(lightTarget).multiplyScalar(.5);
+    beam.quaternion.setFromUnitVectors(upVec,dir.normalize());
+    beam.scale.setScalar(len/d0);
+  });
+  pool.position.set(lightTarget.x,FY+.08,lightTarget.z);
+}
+
+/* ---------- 관객: 정렬된 의자에 앉아서 모델을 바라봄 ---------- */
+const START_X  = 8.0;    // 런웨이 중심에서 첫 줄 의자까지의 거리 (클수록 멀어집니다)
+const ROW_GAP  = 1.9;    // 줄 사이 간격
+const ROWS     = 3;      // 한쪽 줄 수
+const SEATS    = 10;     // 한 줄의 의자 수
+const SEAT_GAP = 2.4;    // 의자 사이 간격 (앞뒤 방향)
+const RISE     = .5;     // 뒷줄이 한 줄마다 높아지는 높이 (0이면 평평)
+const Z0       = 0;      // 첫 의자의 앞뒤 위치
+const CHAIR_COLOR = 0xcfd2d8;
+
+const rnd  = (a,b) => a + Math.random()*(b-a);
+const pick = arr => arr[Math.floor(Math.random()*arr.length)];
+const SKIN  = [0xf1c9a5,0xe0ac8a,0xc68863,0x9a6a48,0x6f4a33];
+const HAIR  = [0x15110e,0x2a1c14,0x4a3020,0x7a5a36,0xb08d57,0x808080];
+const SHIRT = [0x1d1f24,0x2c2f38,0x5a2a2e,0x23403a,0x6b6b72,0xc9c4b8,0x3b3f66,0x7a4a2a];
+const PANTS = [0x15161a,0x23262e,0x3a3f4a,0x2b3a52,0x4a4036];
+const SHOE  = [0x0e0e10,0x1c1c20,0xe8e8e8,0x5a3a26];
+
+const people = [];
+for(const sx of [-1,1]) for(let row=0;row<ROWS;row++) for(let i=0;i<SEATS;i++) people.push({
+  x: sx*(START_X+row*ROW_GAP), y: FY+row*RISE, z: Z0-i*SEAT_GAP,
+  face: sx>0 ? -Math.PI/2 : Math.PI/2,          // 런웨이 쪽을 향함
+  ph: Math.random()*6.28, sp: .6+Math.random()*.6, h: rnd(.95,1.05),
+  phone: Math.random()<.5, long: Math.random()<.4, short: Math.random()<.4,
+  fl: Math.random()*4
+});
+const N = people.length;
+const mk = (geo,material) => { const m = new THREE.InstancedMesh(geo,material,N); m.frustumCulled = false; scene.add(m); return m; };
+const stdMat = () => M(0xffffff,{roughness:.85});
+
+// 계단식 단 (뒷줄일수록 높게)
+const riserMat = M(0x1c1d21,{roughness:.9});
+for(const sx of [-1,1]) for(let r=1;r<ROWS;r++){
+  const hgt = r*RISE;
+  const b = new THREE.Mesh(new THREE.BoxGeometry(ROW_GAP,hgt,SEATS*SEAT_GAP+2),riserMat);
+  b.position.set(sx*(START_X+r*ROW_GAP-.2),FY+hgt/2,Z0-(SEATS-1)*SEAT_GAP/2);
+  scene.add(b);
+}
+
+// 사람 몸 부품
+const THIGH = .9, SHINL = .95;
+const thighGeo = new THREE.CylinderGeometry(.19,.16,THIGH,10).translate(0,-THIGH/2,0);
+const shinGeo  = new THREE.CylinderGeometry(.15,.12,SHINL,10).translate(0,-SHINL/2,0);
+const upGeo  = new THREE.CylinderGeometry(.13,.11,.72,8).translate(0,-.36,0);
+const foGeo  = new THREE.CylinderGeometry(.11,.09,.7,8).translate(0,-.35,0);
+const torsoM = mk(new THREE.CylinderGeometry(.55,.45,1.4,14),stdMat());
+const hipM   = mk(new THREE.BoxGeometry(.9,.35,.55),stdMat());
+const thLM = mk(thighGeo,stdMat()), thRM = mk(thighGeo,stdMat());
+const shLM = mk(shinGeo,stdMat()),  shRM = mk(shinGeo,stdMat());
+const shoeLM = mk(new THREE.BoxGeometry(.32,.18,.6),stdMat()), shoeRM = mk(new THREE.BoxGeometry(.32,.18,.6),stdMat());
+const upLM = mk(upGeo,stdMat()), upRM = mk(upGeo,stdMat());
+const foLM = mk(foGeo,stdMat()), foRM = mk(foGeo,stdMat());
+const neckM  = mk(new THREE.CylinderGeometry(.13,.15,.3,8),stdMat());
+const skullM = mk(new THREE.SphereGeometry(.38,16,12),M(0xffffff,{roughness:.7}));
+const hairCapM  = mk(new THREE.SphereGeometry(.42,14,8,0,Math.PI*2,0,Math.PI*.55),M(0xffffff,{roughness:.6}));
+const hairBackM = mk(new THREE.SphereGeometry(.4,10,8),M(0xffffff,{roughness:.6}));
+const phoneM = mk(new THREE.BoxGeometry(.38,.7,.06),new THREE.MeshBasicMaterial({color:0xffffff}));
+const crowdMeshes = [torsoM,hipM,thLM,thRM,shLM,shRM,shoeLM,shoeRM,upLM,upRM,foLM,foRM,neckM,skullM,hairCapM,hairBackM,phoneM];
+
+// 의자 부품
+const chairMat = M(CHAIR_COLOR,{roughness:.55,metalness:.2});
+const chSeat  = mk(new THREE.BoxGeometry(1.3,.12,1.15),chairMat);
+const chBack  = mk(new THREE.BoxGeometry(1.2,1.0,.1),chairMat);
+const chSideL = mk(new THREE.BoxGeometry(.08,.92,.9),chairMat);
+const chSideR = mk(new THREE.BoxGeometry(.08,.92,.9),chairMat);
+
+// 색 지정
+const cTmp = new THREE.Color(), cDim = new THREE.Color(0x1b2128), cFlash = new THREE.Color(0xffffff);
+const col = (mesh,i,hex) => mesh.setColorAt(i,cTmp.setHex(hex));
+people.forEach((p,i)=>{
+  const sk = pick(SKIN), hr = pick(HAIR), sh = pick(SHIRT), pn = pick(PANTS), so = pick(SHOE);
+  [skullM,neckM].forEach(m=>col(m,i,sk));
+  [hairCapM,hairBackM].forEach(m=>col(m,i,hr));
+  [torsoM,upLM,upRM].forEach(m=>col(m,i,sh));
+  [foLM,foRM].forEach(m=>col(m,i,p.short?sk:sh));
+  [hipM,thLM,thRM,shLM,shRM].forEach(m=>col(m,i,pn));
+  [shoeLM,shoeRM].forEach(m=>col(m,i,so));
+  phoneM.setColorAt(i,cDim);
+});
+
+const rootM = new THREE.Object3D(), part = new THREE.Object3D();
+const headMtx = new THREE.Matrix4(), tmpMtx = new THREE.Matrix4();
+function put(mesh,i,parent,px,py,pz,rx=0,ry=0,rz=0,sx=1,sy=1,sz=1){
+  part.position.set(px,py,pz); part.rotation.set(rx,ry,rz); part.scale.set(sx,sy,sz);
+  part.updateMatrix(); tmpMtx.multiplyMatrices(parent,part.matrix); mesh.setMatrixAt(i,tmpMtx);
+}
+
+// 의자는 움직이지 않으므로 한 번만 배치합니다
+people.forEach((p,i)=>{
+  rootM.position.set(p.x,p.y,p.z); rootM.rotation.set(0,p.face,0); rootM.scale.set(1,1,1); rootM.updateMatrix();
+  put(chSeat,i,rootM.matrix,0,.915,.2);
+  put(chBack,i,rootM.matrix,0,1.5,-.45);
+  put(chSideL,i,rootM.matrix,-.62,.46,.1);
+  put(chSideR,i,rootM.matrix, .62,.46,.1);
+});
+
+const HIP = 1.15;            // 앉았을 때 골반 높이
+const SHLD = HIP + 1.19;     // 어깨 높이
+
+function updateCrowd(t){
+  const on = avatar.visible || holder.visible;
+  const tx = on ? torso.position.x : 0, tz = on ? torso.position.z : 0;   // 모델 위치
+  people.forEach((p,i)=>{
+    const toModel = Math.atan2(tx-p.x,tz-p.z);
+    const twist = clamp(wrap(toModel-p.face)*.2,-.3,.3);                   // 상체를 모델 쪽으로 조금 틀기
+    const bodyYaw = p.face + twist + Math.sin(t*.4*p.sp+p.ph)*.04;
+    const bob = Math.sin(t*1.3*p.sp+p.ph)*.012;                            // 숨 쉬는 듯한 흔들림
+
+    rootM.position.set(p.x,p.y+bob,p.z);
+    rootM.rotation.set(0,bodyYaw,Math.sin(t*.9*p.sp+p.ph)*.02);
+    rootM.scale.setScalar(p.h); rootM.updateMatrix();
+    const R = rootM.matrix;
+
+    // 머리: 모델 쪽으로 고개를 돌림
+    const hy = clamp(wrap(toModel + Math.sin(t*.5*p.sp+p.ph)*.25 - bodyYaw),-1.2,1.2);
+    const hx = (p.phone ? .12 : 0) + Math.sin(t*.7+p.ph)*.04;
+    part.position.set(0,HIP+1.69,0); part.rotation.set(hx,hy,0); part.scale.set(1,1,1); part.updateMatrix();
+    headMtx.multiplyMatrices(R,part.matrix);
+
+    put(torsoM,i,R,0,HIP+.65,0,0,0,0,1,1,.62);
+    put(hipM,i,R,0,HIP,0);
+    put(neckM,i,R,0,HIP+1.37,0);
+
+    // 다리: 허벅지는 앞으로, 종아리는 아래로
+    const aTL = -1.5 + Math.sin(t*.6*p.sp+p.ph)*.03, aTR = -1.5 + Math.sin(t*.6*p.sp+p.ph+1.7)*.03;
+    const aSL = .1 + Math.sin(t*.5*p.sp+p.ph)*.04,  aSR = .1 + Math.sin(t*.5*p.sp+p.ph+2.1)*.04;
+    const leg = (x,aT,aS,thM,shM,shoeM)=>{
+      const ky = HIP - THIGH*Math.cos(aT), kz = -THIGH*Math.sin(aT);       // 무릎 위치
+      const ay = ky - SHINL*Math.cos(aS),  az = kz - SHINL*Math.sin(aS);   // 발목 위치
+      put(thM,i,R,x,HIP,0,aT);
+      put(shM,i,R,x,ky,kz,aS);
+      put(shoeM,i,R,x,ay-.04,az+.12);
+    };
+    leg(-.24,aTL,aSL,thLM,shLM,shoeLM);
+    leg( .24,aTR,aSR,thRM,shRM,shoeRM);
+
+    // 팔: 폰이 없으면 무릎 위에 손을 두고, 폰이 있으면 오른팔을 들어 촬영
+    const aUL = -.12 + Math.sin(t*.7+p.ph)*.02, aFL = -1.25 + Math.sin(t*.8+p.ph)*.08;
+    let aUR = -.12 + Math.sin(t*.6+p.ph)*.02,  aFR = -1.25 + Math.sin(t*.9+p.ph)*.08;
+    if(p.phone){ aUR = -.9 + Math.sin(t*.8+p.ph)*.05; aFR = -2.7 + Math.sin(t*.6+p.ph)*.05; }
+    const elbow = (sx,aU) => [sx*.66, SHLD-.72*Math.cos(aU), -.72*Math.sin(aU)];
+    const eL = elbow(-1,aUL), eR = elbow(1,aUR);
+    put(upLM,i,R,-.66,SHLD,0,aUL);  put(upRM,i,R,.66,SHLD,0,aUR);
+    put(foLM,i,R,eL[0],eL[1],eL[2],aFL);  put(foRM,i,R,eR[0],eR[1],eR[2],aFR);
+    const pv = p.phone ? 1 : 0;                                            // 폰은 오른손 끝에 붙임
+    const hX = eR[0], hY = eR[1]-.7*Math.cos(aFR), hZ = eR[2]-.7*Math.sin(aFR);
+    put(phoneM,i,R,hX-.05,hY+.08,hZ+.1,-.25,0,0,pv,pv,pv);
+
+    // 머리 + 머리카락
+    put(skullM,i,headMtx,0,0,0,0,0,0,1,1.08,1);
+    put(hairCapM,i,headMtx,0,.03,-.02,-.4,0,0);
+    const lg = p.long ? 1 : 0;
+    put(hairBackM,i,headMtx,0,-.3,-.2,0,0,0,.95*lg,1.5*lg,.6*lg);
+    phoneM.setColorAt(i,((t+p.fl)%4)<.08 ? cFlash : cDim);                // 가끔 카메라 플래시
+  });
+  crowdMeshes.forEach(m=>m.instanceMatrix.needsUpdate = true);
+  phoneM.instanceColor.needsUpdate = true;
+}
+
+/* ---------- 캐릭터 ---------- */
+const avatar = new THREE.Group(); avatar.visible = false; scene.add(avatar);
+const UP = new THREE.Vector3(0,1,0);
+const cylGeo = new THREE.CylinderGeometry(1,1,1,16);
+const limb = m0 => { const m = new THREE.Mesh(cylGeo,m0); avatar.add(m); return m; };
+function setLimb(m,a,b,r){
+  const d = b.clone().sub(a), len = d.length() || 1e-3;
+  m.position.copy(a).addScaledVector(d,.5);
+  m.scale.set(r,len,r);
+  m.quaternion.setFromUnitVectors(UP,d.normalize());
+}
+
+const base = M(0xb9bcc4,{roughness:.6});
+const armL1=limb(base),armL2=limb(base),armR1=limb(base),armR2=limb(base);
+const legL1=limb(base),legL2=limb(base),legR1=limb(base),legR2=limb(base);
+const bootL=limb(base),bootR=limb(base),platL=limb(base),platR=limb(base);
+const neck=limb(base);
+const head = add(avatar,new THREE.SphereGeometry(1,24,18),base,[0,0,0]);
+
+const torso = new THREE.Group(); avatar.add(torso);
+let outfitIdx = 0, armW = 1;
+add(torso,new THREE.CylinderGeometry(.42,.5,1.5,24),base,[0,0,0]);
+add(torso,new THREE.CylinderGeometry(.5,.62,.5,24),base,[0,-.85,0]);
+
+const OUTFITS = [];
+
+// ---- 3D 모델(GLB) 의상: 몸통 위치/크기/방향만 따라가는 방식 ----
+const holder = new THREE.Group(); holder.visible = false; scene.add(holder);
+let activeModel = null, modelFit = 1.15;
+const loader = new GLTFLoader();
+function loadModel(o){
+  if(o.promise) return o.promise;
+  o.promise = new Promise((res,rej)=>{
+    loader.load(o.url, g=>{
+      const m = g.scene;
+      m.rotation.y = -Math.PI/2;      // 이 모델은 +X 방향을 보고 있어서 카메라 쪽(+Z)으로 돌림
+      m.position.set(0,-.33,0);       // 모델의 어깨 중심을 기준점에 맞춤
+      m.visible = false; holder.add(m); o.obj = m; res(m);
+    }, e=>{ if(e.total) statusEl.textContent = `모델 불러오는 중… ${Math.round(e.loaded/e.total*100)}%`; }, rej);
+  });
+  return o.promise;
+}
+function setOutfit(i){
+  if(!OUTFITS.length) return;
+  outfitIdx = (i + OUTFITS.length) % OUTFITS.length;
+  const o = OUTFITS[outfitIdx];
+  holder.children.forEach(c=>c.visible=false); holder.visible = false; activeModel = null;
+  if(o.model){
+    avatar.visible = false;
+    if(!o.obj) statusEl.textContent = '모델 불러오는 중… (용량이 커서 몇 초 걸려요)';
+    loadModel(o).then(m=>{
+      if(OUTFITS[outfitIdx]!==o) return;
+      m.visible = true; activeModel = o; statusEl.textContent = '';
+    }).catch(()=>{ statusEl.textContent = '모델 파일을 불러오지 못했어요. 파일 위치와 이름을 확인해 주세요.'; });
+  }
+  [...$('outfits').children].forEach((b,j)=>b.setAttribute('aria-pressed',j===outfitIdx));
+}
+function addButton(i){
+  const b = document.createElement('button');
+  b.textContent = OUTFITS[i].name; b.addEventListener('click',()=>{ setOutfit(i); b.blur(); });
+  $('outfits').appendChild(b);
+}
+function addModel(name,url,select=true){
+  OUTFITS.push({name,model:true,url}); addButton(OUTFITS.length-1);
+  if(select) setOutfit(OUTFITS.length-1);
+}
+// 같은 폴더에 GLB 파일이 있으면 의상 버튼이 자동으로 생깁니다. 파일이 없으면 무시됩니다.
+MODEL_FILES.forEach(m=>fetch(m.url,{method:'HEAD'}).then(r=>{ if(r.ok) addModel(m.name,m.url); }).catch(()=>{}));
+
+/* ---------- 포즈 → 3D 좌표 ---------- */
+const P = Array.from({length:33},()=>new THREE.Vector3());
+let first = true;
+const H = 6;
+const V = (a,b) => P[a].clone().add(P[b]).multiplyScalar(.5);
+
+function update(lm){
+  const va = video.videoWidth / video.videoHeight || 16/9;
+  lm.forEach((l,i)=>{
+    const t = new THREE.Vector3((.5-l.x)*H*va,(.5-l.y)*H,-l.z*H*va*.5);
+    first ? P[i].copy(t) : P[i].lerp(t,.45);
+  });
+  first = false;
+
+  const sw = P[12].distanceTo(P[11]);
+  if (sw < .15) return;
+  const sm = V(11,12), hm = V(23,24);
+  const x = P[12].clone().sub(P[11]).normalize();
+  const y = sm.clone().sub(hm).normalize();
+  const z = new THREE.Vector3().crossVectors(x,y).normalize();
+  x.crossVectors(y,z);
+  torso.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(x,y,z));
+  torso.position.copy(sm).add(hm).multiplyScalar(.5);
+  torso.scale.setScalar(sw);
+  if(activeModel){
+    holder.position.copy(sm); holder.quaternion.copy(torso.quaternion);
+    holder.scale.setScalar(sm.distanceTo(hm)/.36*modelFit); holder.visible = true;
+    return;
+  }
+
+  const k = sw;
+  const headPos = V(7,8).add(new THREE.Vector3(0,.04*k,0));
+  head.position.copy(headPos); head.scale.setScalar(.27*k);
+  setLimb(neck,sm,headPos,.09*k);
+
+  setLimb(armL1,P[11],P[13],.075*k*armW); setLimb(armL2,P[13],P[15],.065*k*armW);
+  setLimb(armR1,P[12],P[14],.075*k*armW); setLimb(armR2,P[14],P[16],.065*k*armW);
+  setLimb(legL1,P[23],P[25],.15*k);  setLimb(legL2,P[25],P[27],.12*k);
+  setLimb(legR1,P[24],P[26],.15*k);  setLimb(legR2,P[26],P[28],.12*k);
+
+  const bl = P[25].clone().lerp(P[27],.3), br = P[26].clone().lerp(P[28],.3);
+  setLimb(bootL,bl,P[27],.19*k); setLimb(bootR,br,P[28],.19*k);
+  const drop = new THREE.Vector3(0,-.16*k,0);
+  setLimb(platL,P[27],P[27].clone().add(drop),.24*k);
+  setLimb(platR,P[28],P[28].clone().add(drop),.24*k);
+  avatar.visible = !(OUTFITS[outfitIdx] && OUTFITS[outfitIdx].model);
+}
+
+/* ---------- 카메라 + MediaPipe ---------- */
+let landmarker = null, lastT = -1;
+async function start(){
+  $('start').disabled = true;
+  try{
+    statusEl.textContent = '인식 모델을 불러오는 중…';
+    const { PoseLandmarker, FilesetResolver } =
+      await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14');
+    const files = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    landmarker = await PoseLandmarker.createFromOptions(files,{
+      baseOptions:{
+        modelAssetPath:'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+        delegate:'GPU'},
+      runningMode:'VIDEO', numPoses:1
+    });
+    statusEl.textContent = '카메라를 켜는 중…';
+    video.srcObject = await navigator.mediaDevices.getUserMedia({video:{width:1280,height:720,facingMode:'user'}});
+    await video.play();
+    statusEl.textContent = '몸을 찾는 중입니다. 전신이 보이게 서주세요.';
+    $('start').style.display = 'none';
+  }catch(e){
+    console.error(e);
+    statusEl.textContent = '시작하지 못했습니다: 인터넷 연결과 카메라 권한을 확인한 뒤 다시 눌러주세요.';
+    $('start').disabled = false;
+  }
+}
+$('start').addEventListener('click',start);
+
+addEventListener('keydown',e=>{
+  if(e.key==='h'||e.key==='H') video.style.display = video.style.display==='none' ? '' : 'none';
+  if(e.key==='f'||e.key==='F') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  if(VIEWS[e.key]) goTo(VIEWS[e.key]);
+  if(e.key==='=' || e.key==='+') modelFit *= 1.05;
+  if(e.key==='-') modelFit /= 1.05;
+  if(e.key==='ArrowRight') setOutfit(outfitIdx+1);
+  if(e.key==='ArrowLeft') setOutfit(outfitIdx-1);
+  if(e.key==='r'||e.key==='R') goTo(VIEWS['1']);
+});
+
+function loop(){
+  requestAnimationFrame(loop);
+  if(landmarker && video.readyState>=2 && video.currentTime!==lastT){
+    lastT = video.currentTime;
+    const res = landmarker.detectForVideo(video,performance.now());
+    if(res.landmarks.length){ update(res.landmarks[0]); statusEl.textContent=''; }
+    else if(avatar.visible || holder.visible){ statusEl.textContent='몸이 인식되지 않아요. 카메라 앞으로 들어와 주세요.'; }
+  }
+  if(tween){
+    tween.t = Math.min(1,tween.t+.04);
+    const e = tween.t*tween.t*(3-2*tween.t);
+    camera.position.lerpVectors(tween.p0,tween.p1,e);
+    controls.target.lerpVectors(tween.t0,tween.t1,e);
+    if(tween.t>=1) tween = null;
+  }
+  controls.update();
+  if(camera.position.y<FY+.5) camera.position.y = FY+.5;
+  updateLights();
+  updateCrowd(performance.now()/1000);
+  renderer.render(scene,camera);
+}
+loop();
+</script>
+</body>
+</html>
